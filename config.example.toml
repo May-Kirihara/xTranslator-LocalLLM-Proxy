@@ -1,0 +1,111 @@
+# Translator Proxy 設定ファイル
+# このファイルを config.toml としてコピーして使用してください
+
+# サーバー設定
+[server]
+host = "0.0.0.0"          # リッスンするホスト
+port = 18080              # リッスンするポート
+log_file = "proxy.log"    # ログファイルパス（省略時は標準出力のみ）
+verbose = false           # 詳細ログの有効化
+reject_batch = true       # バッチリクエストを拒否（xTranslatorを単一リクエストモードに強制）
+crlf_threshold = 10       # CRLF検出閾値（0で無効、この数以上のCRLFでバッチと判断して拒否）
+
+# LLM接続設定（デフォルト）
+[llm]
+endpoint = "http://0.0.0.0:8080"  # llama.cpp サーバーURL
+model = "RWKV-23B-A2B-wakaba-2601-GGUF-IQ4_XS.gguf"  # モデル名 llama.cppではモデル名が入っていてもロードされたモデルでの推論になります
+max_tokens = 8192         # 最大トークン数
+timeout = 300             # HTTPリクエストタイムアウト（秒）
+
+# パイプライン設定
+# enabled = true にすると、マルチステップ処理が有効になります
+# enabled = false の場合は、従来通りのパススルー動作
+[pipeline]
+enabled = true           # パイプラインの有効化
+
+# プロンプトモード:
+#   "replace" - xTranslatorのプロンプトを無視し、ステップのプロンプトのみ使用
+#   "extend"  - xTranslatorのプロンプトにステップのプロンプトを追加
+prompt_mode = "replace"
+
+# 原文マーカー（xTranslatorからの入力の先頭から除去される）
+# 空クエリ対策として使用
+original_marker = "{ORIGINAL_TEXT}"
+
+# 固有名詞辞書（原文 = 翻訳）
+# プロンプト内で {proper_nouns} として参照可能
+[pipeline.proper_nouns]
+"Dragonborn" = "ドラゴンボーン"
+"Whiterun" = "ホワイトラン"
+"Jarl" = "首長"
+"Dovahkiin" = "ドヴァキン"
+"Thu'um" = "スゥーム"
+"Skyrim" = "スカイリム"
+
+# パイプラインステップ（順番に実行）
+#
+# プレースホルダー:
+#   {input}        - 現在の入力テキスト（モードにより異なる）
+#   {original}     - 原文（最初の入力テキスト、常に同じ）
+#   {proper_nouns} - 固有名詞リスト（上記辞書を文字列化したもの）
+#
+# 入力モード (mode):
+#   "chain"     - 前ステップの出力を {input} として使用（デフォルト）
+#   "zero_shot" - 原文を {input} として使用（前ステップの出力を無視）
+
+# ステップ1: 翻訳
+[[pipeline.steps]]
+name = "translate"
+enabled = true
+mode = "zero_shot"  # 最初のステップなので原文を使用
+# ステップ固有のLLM設定（省略時は [llm] セクションの設定を使用）
+# endpoint = "http://0.0.0.0:8080"
+# model = "translation-model.gguf"
+# max_tokens = 4096
+prompt = """以下の英語テキストを日本語に翻訳してください。
+原文の意味を正確に伝えながら、自然な日本語にしてください。
+翻訳結果のみを出力し、説明は不要です。
+
+## 固有名詞（以下の対応表に従って翻訳してください）
+{proper_nouns}
+
+## 原文
+{input}
+"""
+
+# ステップ2: 校正
+[[pipeline.steps]]
+name = "review"
+enabled = false  # デフォルトで無効（必要に応じて有効化）
+mode = "chain"  # 前ステップ（翻訳）の出力を校正
+prompt = """以下の翻訳文をレビューし、不自然な箇所があれば校正してください。
+修正後のテキストのみを出力してください。
+
+## 原文（参考）
+{original}
+
+## 翻訳文
+{input}
+"""
+
+# ステップ3: ポストプロセス（固有名詞置換）
+[[pipeline.steps]]
+name = "postprocess"
+enabled = false  # デフォルトで無効（必要に応じて有効化）
+mode = "chain"
+prompt = """以下のテキストに含まれる固有名詞を、指定された対応表に従って置き換えてください。
+処理後のテキストのみを出力してください。
+
+## 固有名詞対応表
+{proper_nouns}
+
+## テキスト
+{input}
+"""
+
+# 将来機能: 話者別プロンプト
+# [speakers]
+# [speakers.narrator]
+# prompt = "..."
+# [speakers.character_a]
+# prompt = "..."

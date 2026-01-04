@@ -1,0 +1,18 @@
+[project]
+name = "translator-proxy"
+version = "0.1.0"
+description = "xTranslator to llama.cpp proxy server"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115.0",
+    "httpx>=0.28.0",
+    "uvicorn>=0.34.0",
+    "tomli>=2.0.0; python_version < '3.11'",
+]
+
+[project.scripts]
+translator-proxy = "translator_proxy:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

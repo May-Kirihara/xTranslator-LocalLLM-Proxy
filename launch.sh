@@ -1,0 +1,1 @@
+uv run python translator_proxy.py --verbose

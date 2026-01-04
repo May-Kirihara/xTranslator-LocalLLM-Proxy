@@ -12,7 +12,7 @@ xTranslator が OpenAI API 互換エンドポイントにリクエストを送�
 - モデル名を llama.cpp で使用するモデルに自動置換
 - `max_tokens` のデフォルト値を 4096 に設定（出力が途切れるのを防止）
 - `stream: false` を設定
-- CRLF (`\r\n`) を LF (`\n`) に正規化
+<!-- - CRLF (`\r\n`) を LF (`\n`) に正規化 -->
 
 ### レスポンスサニタイズ
 - llama.cpp 固有の `__verbose` フィールドを除去
@@ -26,6 +26,15 @@ xTranslator が OpenAI API 互換エンドポイントにリクエストを送�
 - `reject_batch = true` でバッチリクエストを拒否し、xTranslator のフォールバックモード（単一リクエスト）を強制
 - `crlf_threshold` でCRLF数によるバッチ検出・拒否が可能
 
+### CRLF分割バッチ処理 (新機能)
+xTranslator は CRLF (`\r\n`) 区切りで複数のテキストを1リクエストで送信します。この機能を有効にすると：
+
+- CRLF で分割して個別のテキストとして並列処理
+- llama.cpp の並列スロット (-np) を活用した高速化
+- 結果を CRLF で結合して返却（元の形式を維持）
+- コンテキスト制限に基づく並列数の自動調整
+- エラー時はマーカー（`[TRANSLATION_ERROR]`）で失敗箇所を明示
+
 ### ログ機能
 - リクエスト/レスポンスの詳細をファイルに記録
 - デバッグ用の詳細ログ
@@ -35,6 +44,13 @@ xTranslator が OpenAI API 互換エンドポイントにリクエストを送�
 - 各ステップで異なるLLMエンドポイント/モデルを使用可能
 - xTranslatorのプロンプトを置換または拡張可能
 - TOML設定ファイルで柔軟に設定
+
+### LLM暴走検出 (新機能)
+- LLMがプロンプトを鸚鵡返しする「暴走」をリアルタイム検出
+- NGワードによるXMLタグ等の無限生成検出
+- ストリーミングモードで応答を受信しながら、プロンプト先頭との比較を実行
+- 暴走検出時は即座にストリームを打ち切り、翻訳エラー扱い
+- 空入力（空白・改行のみ）の自動検出・エラー処理
 
 ## インストール
 
@@ -112,7 +128,19 @@ port = 18080
 log_file = "proxy.log"
 verbose = false
 reject_batch = true      # バッチリクエストを拒否してフォールバック強制
-crlf_threshold = 10      # CRLF検出閾値（0で無効）
+
+# CRLF分割バッチ処理
+crlf_batch = true        # CRLF分割バッチ処理を有効化
+crlf_batch_max_parallel = 4      # 最大並列数（llama.cppの-npに合わせる）
+crlf_batch_context_limit = 65536 # 総コンテキスト制限（llama.cppの-cに合わせる）
+crlf_error_marker = "[TRANSLATION_ERROR]"  # エラー時のマーカー
+crlf_threshold = 10      # CRLF検出閾値（crlf_batch=false時のみ有効）
+
+# LLM暴走検出
+runaway_detection = true    # 暴走検出の有効化（ストリーミングモードを使用）
+runaway_prefix_length = 20  # 鸚鵡返し検出の比較文字数
+empty_input_as_error = true # 空入力をエラー扱いにする
+runaway_ng_words = ['<?xml version="1.0"', "<EDID>"]  # NGワードリスト
 
 # LLM接続設定（デフォルト）
 [llm]
@@ -192,16 +220,76 @@ xTranslator の空クエリ対策として、`original_marker` を設定でき�
 original_marker = "{ORIGINAL_TEXT}"  # 先頭から除去される
 ```
 
-### CRLF検出によるバッチ拒否
+### CRLF分割バッチ処理
 
-xTranslator がXML形式のバッチデータを単一リクエストとして送信する場合があります。このようなリクエストはCRLF（`\r\n`）を多数含むため、閾値を設定して検出・拒否できます：
+xTranslator は CRLF 区切りで複数のテキストを1リクエストで送信します。`crlf_batch = true` にすると、これを分割して並列処理します：
 
 ```toml
 [server]
-crlf_threshold = 10  # メッセージ内のCRLFがこの数以上なら400を返す（0で無効）
+crlf_batch = true                # CRLF分割バッチ処理を有効化
+crlf_batch_max_parallel = 4      # 最大並列数（llama.cppの-npスロット数に合わせる）
+crlf_batch_context_limit = 65536 # 総コンテキスト制限（llama.cppの-cに合わせる、0で無制限）
+crlf_error_marker = "[TRANSLATION_ERROR]"  # 推論失敗時のマーカー
+```
+
+**並列数の自動計算:**
+- 並列数 = `min(max_parallel, context_limit / 推定トークン数)`
+- プロンプトのトークン数を推定し、コンテキスト制限を超えないように自動調整
+- llama.cpp の `-c`（コンテキストサイズ）と `-np`（並列スロット数）に合わせて設定
+
+**処理フロー:**
+```
+入力: "Dragon\r\nSword\r\nShield"
+    ↓ CRLF分割
+["Dragon", "Sword", "Shield"]
+    ↓ 並列推論（パイプライン適用）
+["ドラゴン", "剣", "盾"]
+    ↓ CRLF結合
+出力: "ドラゴン\r\n剣\r\n盾"
+```
+
+### CRLF検出によるバッチ拒否
+
+`crlf_batch = false` の場合、CRLF数による拒否が可能です：
+
+```toml
+[server]
+crlf_batch = false
+crlf_threshold = 10  # メッセージ内のCRLFがこの数以上なら拒否（0で無効）
 ```
 
 これにより、xTranslator は自動的にフォールバックモード（単一文字列ごとの翻訳）に切り替わります。
+
+### LLM暴走検出
+
+LLMがプロンプトを鸚鵡返ししたり、XMLタグを無限に生成し続ける「暴走」を検出し、早期に打ち切ります：
+
+```toml
+[server]
+runaway_detection = true    # 暴走検出の有効化（ストリーミングモードを使用）
+runaway_prefix_length = 20  # 鸚鵡返し検出の比較文字数
+empty_input_as_error = true # 空入力をエラー扱いにする
+
+# NGワードリスト（XMLタグ等のメタ文字もそのまま指定可能）
+runaway_ng_words = [
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    "<EDID>",
+]
+```
+
+**動作原理:**
+- `runaway_detection = true` にすると、LLMへのリクエストがストリーミングモードになる
+- **LLMの応答（assistantロール）のみ**をチェック対象とする
+- レスポンスをチャンクごとに受信しながら、以下をチェック：
+  1. プロンプトの先頭N文字と比較（鸚鵡返し検出）
+  2. NGワードリストとの照合（XMLタグ等の無限生成検出）
+- 検出した時点でストリームを即座に打ち切り、翻訳エラーマーカーを返す
+- 空入力（空白・改行のみ）も事前にチェックし、エラー扱いにする
+- チャンク境界を跨ぐNGワードも検出可能（末尾最適化あり）
+
+**NGワードの選定:**
+- プロンプトに翻訳例としてXMLが含まれていても、LLMの応答にXML宣言が出力されれば暴走として検出
+- 期待される応答は翻訳テキストのみであり、XML宣言やタグヘッダーは暴走のサイン
 
 ### HTTPタイムアウト
 
@@ -327,11 +415,17 @@ uv run python translator_proxy.py --verbose
 ## ファイル構成
 
 ```
-translatorproxy/
+xTranslator-LocalLLM-Proxy/
 ├── translator_proxy.py   # メインサーバー
 ├── config.py             # 設定モジュール
 ├── pipeline.py           # パイプライン処理
 ├── config.example.toml   # サンプル設定
+├── config.toml           # 実際の設定ファイル（ユーザー作成）
 ├── pyproject.toml        # プロジェクト設定
-└── README.md             # このファイル
+├── README.md             # このファイル
+├── docs/
+│   ├── handoff.md        # 開発者向け引き継ぎ資料
+│   └── ToDo.md           # タスク管理
+└── test/
+    └── test_crlf_batch.py  # CRLF分割バッチ処理のテスト
 ```

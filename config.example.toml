@@ -5,10 +5,38 @@
 [server]
 host = "0.0.0.0"          # リッスンするホスト
 port = 18080              # リッスンするポート
-log_file = "proxy.log"    # ログファイルパス（省略時は標準出力のみ）
+log_dir = "logs"          # ログディレクトリ（タイムスタンプ付きファイルを起動ごとに作成、省略時は標準出力のみ）
 verbose = false           # 詳細ログの有効化
-reject_batch = true       # バッチリクエストを拒否（xTranslatorを単一リクエストモードに強制）
-crlf_threshold = 10       # CRLF検出閾値（0で無効、この数以上のCRLFでバッチと判断して拒否）
+reject_batch = false       # バッチリクエストを拒否（xTranslatorを単一リクエストモードに強制）
+
+# CRLF分割バッチ処理設定
+# xTranslatorはCRLF区切りで複数テキストを送信する
+# crlf_batch=true: CRLFで分割して並列推論、結果をCRLFで結合して返す
+# crlf_batch=false かつ crlf_threshold>0: CRLFが閾値以上で拒否（フォールバック強制）
+crlf_batch = true                     # CRLF分割バッチ処理を有効化
+crlf_batch_max_parallel = 8           # 最大並列数（llama.cppの-npスロット数に合わせる）
+crlf_batch_context_limit = 65536      # 総コンテキスト制限（llama.cppの-cに合わせる、0で無制限）
+                                      # 並列数は min(max_parallel, context_limit / 推定トークン数) で決定
+crlf_error_marker = "[TRANSLATION_ERROR]"  # 推論失敗時のマーカー
+crlf_threshold = 10                   # CRLF検出閾値（crlf_batch=falseの時のみ有効）
+
+# LLM暴走検出設定
+# LLMがプロンプトを鸚鵡返しする「暴走」を検出し、早期に打ち切る
+runaway_detection = true              # 暴走検出の有効化（ストリーミングモードを使用）
+runaway_prefix_length = 20            # 鸚鵡返し検出の比較文字数（プロンプト先頭N文字と応答を比較）
+empty_input_as_error = true           # 空入力（空白・改行のみ）をエラー扱いにする
+# NGワードリスト（XMLタグ等のメタ文字もそのまま指定可能）
+runaway_ng_words = [
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    "<EDID>",
+]
+# プレースホルダー変換設定
+# XMLタグ風のマーカーをLLMが誤認しないよう、別の形式に変換してから送信し、応答後に復元する
+# 形式: [[変換元, 変換先], ...]
+placeholder_replacements = [
+    ["<L_F>", "[LF]"],      # 改行マーカー
+    ["<BR>", "[BR]"],       # 改行タグ
+]
 
 # LLM接続設定（デフォルト）
 [llm]

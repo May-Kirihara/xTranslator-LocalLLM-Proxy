@@ -210,3 +210,4 @@ old/
 .claude
 config.toml
 uv.lock
+logs/

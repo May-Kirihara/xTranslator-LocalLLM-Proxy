@@ -20,11 +20,24 @@ class ServerConfig:
     """サーバー設定"""
     host: str = "0.0.0.0"
     port: int = 18080
-    log_file: str | None = None
+    log_dir: str | None = None  # ログディレクトリ（タイムスタンプ付きファイルを作成）
     verbose: bool = False
     reject_batch: bool = False  # バッチリクエストを拒否してフォールバックさせる
-    # CRLF検出によるバッチ拒否（0で無効、正数で閾値）
+    # CRLF検出によるバッチ拒否（0で無効、正数で閾値）- crlf_batchとは排他
     crlf_threshold: int = 0
+    # CRLF分割バッチ処理（CRLFで分割して並列推論）
+    crlf_batch: bool = False
+    crlf_batch_max_parallel: int = 8  # 最大並列数（ハード上限）
+    crlf_batch_context_limit: int = 0  # 総コンテキスト制限（0で無制限）
+    crlf_error_marker: str = "[TRANSLATION_ERROR]"  # エラー時のマーカー
+    # LLM暴走検出設定
+    runaway_detection: bool = True  # 暴走検出の有効化
+    runaway_prefix_length: int = 20  # 鸚鵡返し検出の比較文字数
+    runaway_ng_words: list[str] = field(default_factory=list)  # NGワードリスト（単純文字列マッチ）
+    empty_input_as_error: bool = True  # 空入力をエラー扱いにする
+    # プレースホルダー変換設定（LLMに送る前に変換、応答後に復元）
+    # 形式: [[変換元, 変換先], ...]  例: [["<L_F>", "[LF]"]]
+    placeholder_replacements: list[list[str]] = field(default_factory=list)
 
 
 @dataclass
@@ -92,10 +105,19 @@ class Config:
         server = ServerConfig(
             host=server_data.get("host", "0.0.0.0"),
             port=server_data.get("port", 18080),
-            log_file=server_data.get("log_file"),
+            log_dir=server_data.get("log_dir"),
             verbose=server_data.get("verbose", False),
             reject_batch=server_data.get("reject_batch", False),
             crlf_threshold=server_data.get("crlf_threshold", 0),
+            crlf_batch=server_data.get("crlf_batch", False),
+            crlf_batch_max_parallel=server_data.get("crlf_batch_max_parallel", 8),
+            crlf_batch_context_limit=server_data.get("crlf_batch_context_limit", 0),
+            crlf_error_marker=server_data.get("crlf_error_marker", "[TRANSLATION_ERROR]"),
+            runaway_detection=server_data.get("runaway_detection", True),
+            runaway_prefix_length=server_data.get("runaway_prefix_length", 20),
+            runaway_ng_words=server_data.get("runaway_ng_words", []),
+            empty_input_as_error=server_data.get("empty_input_as_error", True),
+            placeholder_replacements=server_data.get("placeholder_replacements", []),
         )
 
         # LLM設定（必須項目のチェック）

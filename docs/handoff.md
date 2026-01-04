@@ -32,6 +32,28 @@ xTranslator
     |
     +-- reject_batch=true の場合 --> 400エラー返却 --> フォールバック強制
     |
+    +-- crlf_batch=true の場合（CRLF分割バッチ処理）
+    |       |
+    |       +---> "{ORIGINAL_TEXT}\r\nDragon\r\nSword\r\nShield"
+    |       |         |
+    |       |         v (1. マーカー除去)
+    |       +---> "\r\nDragon\r\nSword\r\nShield"
+    |       |         |
+    |       |         v (2. 先頭CRLF除去)
+    |       +---> "Dragon\r\nSword\r\nShield"
+    |       |         |
+    |       |         v (3. CRLFで分割)
+    |       +---> ["Dragon", "Sword", "Shield"]
+    |       |         |
+    |       |         v (4. 並列HTTP推論、各テキストにパイプライン適用)
+    |       +---> ["ドラゴン", "剣", "盾"]
+    |       |         |
+    |       |         v (5. CRLFで結合)
+    |       +---> "ドラゴン\r\n剣\r\n盾"
+    |                 |
+    |                 v
+    |             Response
+    |
     +-- pipeline.enabled=true の場合
     |       |
     |       +---> Step 1: translate (mode=zero_shot)
@@ -65,10 +87,12 @@ xTranslator
 
 | クラス/関数 | 説明 |
 |-------------|------|
+| `RunawayDetectedError` | LLM暴走（鸚鵡返し）検出時の例外 |
 | `Pipeline` | パイプライン実行エンジン |
 | `Pipeline.format_proper_nouns()` | 固有名詞辞書を文字列にフォーマット |
 | `Pipeline.build_prompt()` | プレースホルダー置換 (`{input}`, `{original}`, `{proper_nouns}`) |
-| `Pipeline.execute_step()` | 単一ステップ実行（HTTP POST to LLM） |
+| `Pipeline._check_runaway()` | 鸚鵡返しをチェック（プロンプト先頭N文字と応答を比較） |
+| `Pipeline.execute_step()` | 単一ステップ実行（ストリーミング対応・暴走検出付き） |
 | `Pipeline.execute()` | パイプライン全体実行 |
 | `extract_user_content()` | messages から user role のコンテンツ抽出 |
 
@@ -76,11 +100,19 @@ xTranslator
 
 | 関数 | 説明 |
 |------|------|
+| `apply_placeholder_replacements()` | プレースホルダーを変換（LLMに送る前） |
+| `restore_placeholder_replacements()` | プレースホルダーを復元（LLM応答後） |
 | `setup_logging()` | ログ設定（ファイル + コンソール） |
 | `parse_json()` | JSON パース（エラー時は None、エラーログ出力） |
 | `fix_completion_request()` | リクエスト補正（model, max_tokens, stream, CRLF正規化） |
 | `sanitize_response()` | レスポンスから `__verbose` 等を除去 |
 | `build_response_from_content()` | パイプライン結果から OpenAI 互換レスポンス構築 |
+| `estimate_tokens()` | テキストのトークン数を概算 |
+| `calculate_parallel_limit()` | コンテキスト制限に基づいて並列数を計算 |
+| `process_crlf_batch()` | CRLF分割バッチ処理のメイン関数 |
+| `process_single_text_with_pipeline()` | 単一テキストをパイプライン処理（空入力・暴走検出付き） |
+| `_check_runaway_passthrough()` | パススルー用の鸚鵡返しチェック |
+| `process_single_text_passthrough()` | 単一テキストをパススルー処理（ストリーミング・暴走検出付き） |
 | `passthrough()` | メインルーティングハンドラ |
 | `main()` | CLI引数処理、設定読み込み、サーバー起動 |
 
@@ -92,10 +124,19 @@ xTranslator
 |-----------|-----|-----------|------|
 | `host` | str | "0.0.0.0" | リッスンホスト |
 | `port` | int | 18080 | リッスンポート |
-| `log_file` | str\|null | null | ログファイルパス |
+| `log_dir` | str\|null | null | ログディレクトリ（起動ごとにタイムスタンプ付きファイルを作成） |
 | `verbose` | bool | false | 詳細ログ有効化 |
 | `reject_batch` | bool | false | バッチリクエスト拒否 |
-| `crlf_threshold` | int | 0 | CRLF検出閾値（0で無効） |
+| `crlf_batch` | bool | false | CRLF分割バッチ処理を有効化 |
+| `crlf_batch_max_parallel` | int | 8 | CRLF分割時の最大並列数（ハード上限） |
+| `crlf_batch_context_limit` | int | 0 | 総コンテキスト制限（0で無制限）。並列数はmin(max_parallel, context_limit/推定トークン数)で決定 |
+| `crlf_error_marker` | str | "[TRANSLATION_ERROR]" | 推論失敗時のマーカー |
+| `runaway_detection` | bool | true | LLM暴走検出の有効化（ストリーミングモードを使用） |
+| `runaway_prefix_length` | int | 20 | 鸚鵡返し検出の比較文字数 |
+| `runaway_ng_words` | list[str] | [] | NGワードリスト（単純文字列マッチ、XMLタグ等もそのまま指定可能） |
+| `empty_input_as_error` | bool | true | 空入力をエラー扱いにする |
+| `placeholder_replacements` | list[list[str]] | [] | プレースホルダー変換ルール（LLM送信前に変換、応答後に復元） |
+| `crlf_threshold` | int | 0 | CRLF検出閾値（crlf_batch=false時のみ有効） |
 
 ### [llm]
 
@@ -137,17 +178,66 @@ xTranslator
 
 ## 既知の問題と対策
 
-### xTranslator「仮想配列が破損」エラー
+### xTranslator「仮想配列が破損」エラー（XMLバッチ処理）
 
 **原因**: LLM が XML 形式ではなくプレーンテキストで応答するため、xTranslator のバッチ処理が失敗する
 
 **対策**: `reject_batch = true` を設定し、最初からフォールバックモード（単一リクエスト）で動作させる
+
+### xTranslator「仮想配列が破損」エラー（CRLF分割バッチ処理）
+
+**原因**: レスポンスの先頭に余分な空行（`\r\n`）が入ると、xTranslator が期待する行数と一致しなくなる
+
+**対策**: `process_crlf_batch()` 内でマーカー除去後に先頭のCRLFも除去している。この処理を削除・変更しないこと
 
 ### 空クエリ問題
 
 **原因**: xTranslator が空文字列を送信することがある
 
 **対策**: `original_marker = "{ORIGINAL_TEXT}"` を設定し、xTranslator 側でクエリ先頭にマーカーを付加。プロキシ側で自動除去する
+
+### LLM暴走（鸚鵡返し・XMLタグ生成）問題
+
+**原因**: LLMが入力プロンプトをそのまま出力し始めたり、XMLタグを無限に生成し続ける「暴走」が発生することがある
+
+**対策**:
+1. **鸚鵡返し検出**: `runaway_detection = true` を設定（デフォルト有効）。ストリーミングモードでLLMの応答を受信しながら、プロンプトの先頭N文字（`runaway_prefix_length`、デフォルト20文字）と比較。一致を検出した時点でストリームを打ち切り、翻訳エラー扱いにする
+
+2. **NGワード検出**: `runaway_ng_words` にNGワードリストを設定。XMLタグ等のメタ文字もそのまま指定可能（単純文字列マッチ）。チャンク境界を跨ぐNGワードも検出可能（末尾最適化あり）
+   ```toml
+   runaway_ng_words = [
+       '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+       "<EDID>",
+   ]
+   ```
+
+**重要**: NGワード検出は**LLMの応答（assistantロール）のみ**をチェック対象とする。プロンプト（userロール）に翻訳例としてXMLが含まれていても、LLMの応答にXML宣言が出力されれば暴走として検出される。期待される応答は翻訳テキストのみであり、XML宣言やタグヘッダーは暴走のサインである。
+
+### XMLタグ風マーカーの誤認問題
+
+**原因**: 入力テキストに `<L_F>` のようなXMLタグ風の改行マーカーが含まれていると、LLMがXML形式の入力と誤認し、XML形式で応答しようとして暴走する
+
+**対策**: `placeholder_replacements` を設定し、XMLタグ風マーカーを別の形式に変換してからLLMに送信する。応答後に元の形式に復元される
+```toml
+placeholder_replacements = [
+    ["<L_F>", "[LF]"],      # 改行マーカー
+    ["<BR>", "[BR]"],       # 改行タグ
+]
+```
+
+この設定により、`<L_F>` は `[LF]` に変換されてLLMに送信され、応答の `[LF]` は `<L_F>` に復元される。
+
+### 空入力の翻訳
+
+**原因**: 空文字列や空白・改行のみの入力をLLMに送ると、意味のない応答や暴走を引き起こす
+
+**対策**: `empty_input_as_error = true` を設定（デフォルト有効）。空入力を検出した時点で即座にエラーマーカーを返す
+
+### CRLF分割バッチ処理が極端に遅い
+
+**原因**: xTranslator の入力形式は `{ORIGINAL_TEXT}\r\n行1\r\n行2\r\n...` であり、マーカーは最初のCRLFの**前**に付加される。CRLF分割を先に行うと、最初のテキストがマーカーのみになり、マーカー除去後は空文字列として処理される。空文字列を翻訳しようとすると、LLM がプロンプト内の例を再生成しようとして数分かかる
+
+**対策**: `process_crlf_batch()` 内でCRLF分割の**前に**マーカーを除去している。この順序を変更しないこと
 
 ## 開発・デバッグ
 
@@ -160,9 +250,11 @@ uv run translator-proxy
 # 設定ファイル指定
 uv run translator-proxy --config config.toml
 
-# 詳細ログ有効化
-uv run translator-proxy --verbose --log proxy.log
+# 詳細ログ有効化（logs/ ディレクトリにタイムスタンプ付きファイルを作成）
+uv run translator-proxy --verbose --log-dir logs
 ```
+
+ログファイルは起動ごとに `logs/proxy_YYYYMMDD_HHMMSS.log` の形式で作成されます。
 
 ### ログ確認
 
@@ -175,7 +267,29 @@ grep "Pipeline step" proxy.log
 
 # エラー確認
 grep -i error proxy.log
+
+# CRLF分割バッチ処理のデバッグ
+grep "CRLF" proxy.log
+
+# リクエスト/レスポンス全文確認（デバッグログが有効な場合）
+grep -A 10 "CRLF REQUEST FULL" proxy.log
+grep -A 10 "CRLF RESPONSE FULL" proxy.log
 ```
+
+### CRLF分割バッチ処理のトラブルシューティング
+
+1. **処理が極端に遅い（数分かかる）場合**
+   - ログで `CRLF batch item X: sending text (0 chars)` を確認
+   - 空文字列が処理されている場合、マーカー除去のロジックに問題がある
+
+2. **xTranslator で「仮想配列が破損」エラーが出る場合**
+   - ログで `CRLF RESPONSE FULL` を確認
+   - レスポンスの先頭に空行がないか確認
+   - 入力と出力の行数が一致しているか確認
+
+3. **一部の行が翻訳されない場合**
+   - LLM が翻訳せずに原文をそのまま返している可能性
+   - プロンプトの調整が必要
 
 ### テスト方法
 

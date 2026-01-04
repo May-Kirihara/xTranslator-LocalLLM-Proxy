@@ -15,6 +15,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger("translator-proxy")
 
 
+class RunawayDetectedError(Exception):
+    """LLM暴走（鸚鵡返し）検出時の例外"""
+
+    def __init__(self, message: str, partial_content: str = ""):
+        super().__init__(message)
+        self.partial_content = partial_content
+
+
 class Pipeline:
     """マルチステップ翻訳パイプライン"""
 
@@ -88,6 +96,50 @@ class Pipeline:
         """Chat Completion用のmessages配列を構築"""
         return [{"role": "user", "content": prompt}]
 
+    def _check_runaway(self, prompt: str, content: str, prev_content_len: int = 0) -> tuple[bool, str]:
+        """鸚鵡返し・NGワードをチェック
+
+        Args:
+            prompt: LLMに送信したプロンプト
+            content: LLMからの応答（途中または全体）
+            prev_content_len: 前回チェック時のcontent長（NGワード検出の最適化用）
+
+        Returns:
+            (検出フラグ, 検出理由)
+        """
+        if not self.config.server.runaway_detection:
+            return False, ""
+
+        # 1. 鸚鵡返しチェック（プロンプト先頭との比較）
+        prefix_len = self.config.server.runaway_prefix_length
+        if prefix_len > 0:
+            prompt_prefix = prompt[:prefix_len]
+            content_prefix = content[:prefix_len]
+
+            if len(content_prefix) >= prefix_len and content_prefix == prompt_prefix:
+                return True, "prompt echo"
+
+        # 2. NGワードチェック（末尾最適化）
+        # LLMの応答にNGワードが含まれていたら暴走として検出
+        ng_words = self.config.server.runaway_ng_words
+        if ng_words:
+            # NGワードの最大長を取得
+            max_ng_len = max(len(w) for w in ng_words)
+
+            # チェック対象範囲を計算（新しく追加された部分 + NGワード最大長のバッファ）
+            # これにより、チャンク境界を跨ぐNGワードも検出可能
+            if prev_content_len > max_ng_len:
+                check_start = prev_content_len - max_ng_len
+            else:
+                check_start = 0
+            check_content = content[check_start:]
+
+            for ng_word in ng_words:
+                if ng_word in check_content:
+                    return True, f"NG word: {ng_word}"
+
+        return False, ""
+
     async def execute_step(
         self,
         client: httpx.AsyncClient,
@@ -96,7 +148,7 @@ class Pipeline:
         original_text: str,
         original_messages: list[dict] | None = None,
     ) -> str:
-        """単一ステップを実行
+        """単一ステップを実行（ストリーミング対応・暴走検出付き）
 
         Args:
             client: HTTPクライアント
@@ -107,47 +159,100 @@ class Pipeline:
 
         Returns:
             LLMからの応答テキスト
+
+        Raises:
+            RunawayDetectedError: 鸚鵡返しを検出した場合
         """
         endpoint, model, max_tokens = self.config.get_step_llm_config(step)
 
         prompt = self.build_prompt(step, input_text, original_text, original_messages)
         messages = self.build_messages(prompt)
 
+        # 暴走検出が有効な場合はストリーミングを使用
+        use_streaming = self.config.server.runaway_detection
+
         request_data = {
             "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
-            "stream": False,
+            "stream": use_streaming,
         }
 
         headers = {
             "Content-Type": "application/json",
-            "Accept": "application/json",
+            "Accept": "application/json" if not use_streaming else "text/event-stream",
             "Accept-Encoding": "identity",
             "Connection": "close",
         }
 
-        logger.info(f"  Pipeline step '{step.name}': sending to {endpoint}")
+        logger.info(f"  Pipeline step '{step.name}': sending to {endpoint} (prompt={len(prompt)} chars, max_tokens={max_tokens}, streaming={use_streaming})")
         logger.debug(f"  Prompt: {prompt[:200]}...")
 
         url = f"{endpoint}/v1/chat/completions"
-        response = await client.post(url, headers=headers, json=request_data)
 
-        if response.status_code != 200:
-            logger.error(f"  Step '{step.name}' failed: status={response.status_code}")
-            raise RuntimeError(f"Step '{step.name}' failed with status {response.status_code}")
+        if use_streaming:
+            # ストリーミングモード: チャンクごとに暴走検出
+            content = ""
+            prev_content_len = 0
 
-        result = response.json()
+            async with client.stream("POST", url, headers=headers, json=request_data) as response:
+                if response.status_code != 200:
+                    logger.error(f"  Step '{step.name}' failed: status={response.status_code}")
+                    raise RuntimeError(f"Step '{step.name}' failed with status {response.status_code}")
 
-        # 応答テキストを抽出
-        choices = result.get("choices", [])
-        if not choices:
-            raise RuntimeError(f"Step '{step.name}' returned no choices")
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
 
-        content = choices[0].get("message", {}).get("content", "")
-        logger.info(f"  Step '{step.name}' completed: {len(content)} chars")
+                    # SSE形式: "data: {...}" or "data: [DONE]"
+                    if line.startswith("data: "):
+                        data_str = line[6:]  # "data: " を除去
+                        if data_str == "[DONE]":
+                            break
 
-        return content
+                        try:
+                            data = json.loads(data_str)
+                            choices = data.get("choices", [])
+                            if choices:
+                                delta = choices[0].get("delta", {})
+                                chunk_content = delta.get("content", "")
+                                if chunk_content:
+                                    content += chunk_content
+
+                                    # 暴走検出: 鸚鵡返し・NGワードチェック
+                                    detected, reason = self._check_runaway(prompt, content, prev_content_len)
+                                    if detected:
+                                        logger.warning(f"  Step '{step.name}': RUNAWAY DETECTED - {reason}")
+                                        raise RunawayDetectedError(
+                                            f"LLM runaway detected in step '{step.name}': {reason}",
+                                            partial_content=content,
+                                        )
+                                    prev_content_len = len(content)
+                        except json.JSONDecodeError:
+                            continue
+
+            logger.info(f"  Step '{step.name}' completed: {len(content)} chars")
+            return content
+
+        else:
+            # 非ストリーミングモード（従来の処理）
+            response = await client.post(url, headers=headers, json=request_data)
+
+            if response.status_code != 200:
+                logger.error(f"  Step '{step.name}' failed: status={response.status_code}")
+                raise RuntimeError(f"Step '{step.name}' failed with status {response.status_code}")
+
+            result = response.json()
+
+            # 応答テキストを抽出
+            choices = result.get("choices", [])
+            if not choices:
+                raise RuntimeError(f"Step '{step.name}' returned no choices")
+
+            content = choices[0].get("message", {}).get("content", "")
+            logger.info(f"  Step '{step.name}' completed: {len(content)} chars")
+
+            return content
 
     async def execute(
         self,
